@@ -1,0 +1,2 @@
+hidapi>=0.15.0
+PySide6-Essentials>=6.7
