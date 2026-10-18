@@ -21,3 +21,9 @@ To regenerate: `python -m pip install Pillow PySide6-Essentials`, then
 
 The icon is a dark green rounded square with the Lucide mouse glyph and a mint
 glow. The same SVG is rendered by the device preview in the app.
+
+## `check_white.svg`, `check_dark.svg`
+
+Small check marks for the autostart checkbox. They are part of this project
+(no third-party artwork) and are drawn to match the accent colour of the light
+and dark themes.

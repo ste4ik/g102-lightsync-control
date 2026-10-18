@@ -54,12 +54,14 @@ from PySide6.QtWidgets import (
     QAbstractButton,
     QApplication,
     QButtonGroup,
+    QCheckBox,
     QColorDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -67,6 +69,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSlider,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
@@ -76,8 +79,26 @@ from hid_backend import G102Mouse, HidppError
 ROOT = Path(__file__).resolve().parent
 ASSETS = ROOT / "assets"
 
+APP_VERSION = "1.2"
+AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_NAME = "G102 Lightsync Control"
+
+
+def _data_dir() -> Path:
+    """Writable directory for config.json (next to the script, or %APPDATA% when frozen)."""
+    if getattr(sys, "frozen", False):
+        base = Path(os.environ.get("APPDATA") or Path.home())
+        path = base / "G102 Lightsync Control"
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        return path
+    return ROOT
+
+
 _config_override = os.environ.get("G102_CONFIG")
-CONFIG_PATH = Path(_config_override) if _config_override else ROOT / "config.json"
+CONFIG_PATH = Path(_config_override) if _config_override else _data_dir() / "config.json"
 
 DEFAULT_CONFIG = {
     "dpi": {
@@ -90,6 +111,9 @@ DEFAULT_CONFIG = {
         "color": "#00E5A0",
         "brightness": 100,
         "speed": 60,
+    },
+    "app": {
+        "autostart": False,
     },
 }
 
@@ -364,6 +388,27 @@ QRadioButton::indicator:hover {
 QRadioButton::indicator:checked {
     background: $ACCENT;
     border: 3px solid $ACCENT_SOFT;
+}
+
+QCheckBox {
+    color: $TEXT;
+    spacing: 10px;
+    background: transparent;
+}
+QCheckBox::indicator {
+    width: 18px;
+    height: 18px;
+    border-radius: 5px;
+    border: 1px solid $BORDER;
+    background: $FIELD;
+}
+QCheckBox::indicator:hover {
+    border-color: $ACCENT_BORDER;
+}
+QCheckBox::indicator:checked {
+    background: $ACCENT;
+    border-color: $ACCENT;
+    image: url("$CHECK_ICON");
 }
 
 QSlider {
@@ -659,6 +704,12 @@ def load_config() -> dict:
         except (TypeError, ValueError):
             lighting[key] = default
 
+    app_cfg = config.get("app")
+    if not isinstance(app_cfg, dict):
+        app_cfg = {}
+        config["app"] = app_cfg
+    app_cfg["autostart"] = bool(app_cfg.get("autostart", False))
+
     return config
 
 
@@ -670,6 +721,64 @@ def save_config(config: dict) -> None:
         )
     except OSError:
         pass
+
+
+# ------------------------------------------------------------------ autostart
+def startup_command() -> str:
+    """Command Windows should run at login."""
+    if getattr(sys, "frozen", False):
+        return f'"{Path(sys.executable)}"'
+    python = Path(sys.executable)
+    pythonw = python.with_name("pythonw.exe")
+    if pythonw.exists():
+        python = pythonw
+    return f'"{python}" "{ROOT / "main.py"}"'
+
+
+def read_autostart() -> str | None:
+    if sys.platform != "win32":
+        return None
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY) as key:
+            value, _kind = winreg.QueryValueEx(key, AUTOSTART_NAME)
+            return str(value)
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def set_autostart(enabled: bool) -> None:
+    """Create or remove the HKCU Run entry. Raises OSError on failure."""
+    if sys.platform != "win32":
+        raise OSError("Автозапуск поддерживается только в Windows.")
+    import winreg
+
+    if enabled:
+        with winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, winreg.KEY_SET_VALUE
+        ) as key:
+            winreg.SetValueEx(key, AUTOSTART_NAME, 0, winreg.REG_SZ, startup_command())
+    else:
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, winreg.KEY_SET_VALUE
+            ) as key:
+                winreg.DeleteValue(key, AUTOSTART_NAME)
+        except FileNotFoundError:
+            pass
+
+
+def sync_autostart(enabled: bool) -> bool:
+    """Make the registry match the setting. Returns True when something changed."""
+    if sys.platform != "win32":
+        return False
+    current = read_autostart()
+    command = startup_command() if enabled else None
+    if current == command:
+        return False
+    set_autostart(enabled)
+    return True
 
 
 def hex_to_rgb(value: str) -> tuple[int, int, int]:
@@ -1162,16 +1271,21 @@ class App(QMainWindow):
         self._loading = True
         self._ready = False
         self._closing = False
+        self._quitting = False
         self._applying = False
         self._apply_pending = False
         self._dirty: set[str] = set()
         self._palette_guard = False
         self._intro_started = False
         self._intro_animation: QPropertyAnimation | None = None
+        self._tray_hint_shown = False
         self._workers: set[Worker] = set()
         self._last_product = ""
         self.dpi_rows: list[dict] = []
         self.preset_buttons: list[tuple[SwatchButton, str]] = []
+        self.tray: QSystemTrayIcon | None = None
+        self.tray_menu: QMenu | None = None
+        self.tray_autostart_action: QAction | None = None
 
         self.active_index = int(self.cfg["dpi"]["active_level"])
         self.poll_rate = int(self.cfg["polling_rate"])
@@ -1215,6 +1329,7 @@ class App(QMainWindow):
         self._build_ui()
         self._apply_theme()
         self._sync_stage()
+        self._setup_tray()
 
         self._log("Закройте Logitech G HUB перед подключением: он занимает интерфейс HID++.")
         self._log("Настройки применяются автоматически. Мышь подключается сама, если она найдена.")
@@ -1222,6 +1337,9 @@ class App(QMainWindow):
         self._set_status("Не подключено", "idle")
         self._loading = False
         self._ready = True
+
+        if os.environ.get("G102_NO_AUTOSTART_SYNC") != "1":
+            QTimer.singleShot(0, self._sync_autostart_on_start)
 
         hints = QGuiApplication.styleHints()
         hints.colorSchemeChanged.connect(self._on_color_scheme_changed)
@@ -1249,7 +1367,7 @@ class App(QMainWindow):
         device.addSeparator()
         quit_action = QAction("Выход", self)
         quit_action.setShortcut(QKeySequence.StandardKey.Quit)
-        quit_action.triggered.connect(self.close)
+        quit_action.triggered.connect(self._quit)
         device.addAction(quit_action)
 
         log_menu = bar.addMenu("Журнал")
@@ -1345,6 +1463,7 @@ class App(QMainWindow):
         self._build_dpi_section(self.settings_layout)
         self._build_polling_section(self.settings_layout)
         self._build_lighting_section(self.settings_layout)
+        self._build_app_section(self.settings_layout)
         self.settings_layout.addStretch(1)
 
         self._build_device_panel(inspector_layout)
@@ -1825,6 +1944,141 @@ class App(QMainWindow):
         if chosen.isValid():
             self._set_color(chosen.name().upper())
 
+    # ------------------------------------------------------------------ app
+    def _build_app_section(self, parent_layout: QVBoxLayout) -> None:
+        card = self._section(
+            parent_layout,
+            "Приложение",
+            "Запуск вместе с Windows и поведение окна.",
+        )
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(6)
+
+        self.autostart_check = QCheckBox("Запускать при входе в Windows")
+        self.autostart_check.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.autostart_check.setChecked(bool(self.cfg.get("app", {}).get("autostart", False)))
+        self.autostart_check.toggled.connect(self._on_autostart_toggled)
+        layout.addWidget(self.autostart_check)
+
+        hint = QLabel(
+            "При закрытии окна приложение остаётся в трее; выход — через меню иконки."
+        )
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+    def _on_autostart_toggled(self, checked: bool) -> None:
+        if self._loading:
+            return
+        enabled = bool(checked)
+        try:
+            set_autostart(enabled)
+        except OSError as exc:
+            self._log(f"Не удалось изменить автозапуск: {exc}")
+            QMessageBox.warning(
+                self,
+                "Автозапуск",
+                "Не удалось изменить настройку автозапуска.\n" + str(exc),
+            )
+            self._loading = True
+            try:
+                if hasattr(self, "autostart_check"):
+                    self.autostart_check.setChecked(not enabled)
+                if self.tray_autostart_action is not None:
+                    self.tray_autostart_action.setChecked(not enabled)
+            finally:
+                self._loading = False
+            return
+
+        self.cfg.setdefault("app", {})["autostart"] = enabled
+        self._loading = True
+        try:
+            if hasattr(self, "autostart_check"):
+                self.autostart_check.setChecked(enabled)
+            if self.tray_autostart_action is not None:
+                self.tray_autostart_action.setChecked(enabled)
+        finally:
+            self._loading = False
+        self._persist()
+        self._log("Автозапуск включён." if enabled else "Автозапуск выключен.")
+
+    def _sync_autostart_on_start(self) -> None:
+        enabled = bool(self.cfg.get("app", {}).get("autostart", False))
+        try:
+            changed = sync_autostart(enabled)
+        except OSError as exc:
+            self._log(f"Не удалось обновить автозапуск: {exc}")
+            return
+        if changed:
+            self._log(
+                "Автозапуск обновлён для текущего расположения приложения."
+                if enabled
+                else "Запись автозапуска удалена."
+            )
+
+    def _setup_tray(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self._log("Область уведомлений недоступна: окно закрывается обычным образом.")
+            return
+
+        icon = self.windowIcon()
+        if icon.isNull():
+            icon = load_app_icon()
+        self.tray = QSystemTrayIcon(icon, self)
+        self.tray.setToolTip("G102 Lightsync Control")
+
+        menu = QMenu(self)
+        show_action = menu.addAction("Открыть окно")
+        show_action.triggered.connect(self._restore_window)
+        menu.addSeparator()
+
+        apply_action = menu.addAction("Применить сейчас")
+        apply_action.triggered.connect(self._manual_apply)
+        menu.addSeparator()
+
+        autostart_action = menu.addAction("Запускать при входе в Windows")
+        autostart_action.setCheckable(True)
+        autostart_action.setChecked(self.autostart_check.isChecked())
+        autostart_action.toggled.connect(self._on_autostart_toggled)
+        self.tray_autostart_action = autostart_action
+        menu.addSeparator()
+
+        quit_action = menu.addAction("Выход")
+        quit_action.triggered.connect(self._quit)
+
+        self.tray_menu = menu
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.show()
+
+        app = QApplication.instance()
+        if app is not None:
+            app.setQuitOnLastWindowClosed(False)
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self._restore_window()
+
+    def _restore_window(self) -> None:
+        self.setWindowOpacity(1.0)
+        self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit(self) -> None:
+        if self._quitting:
+            return
+        self._quitting = True
+        self.close()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
     # ---------------------------------------------------------------- inspector
     def _build_device_panel(self, inspector_layout: QVBoxLayout) -> None:
         card = QFrame()
@@ -1967,7 +2221,9 @@ class App(QMainWindow):
     # ------------------------------------------------------------------ theme
     def _apply_theme(self) -> None:
         self.theme_name = "dark" if _system_is_dark() else "light"
-        self.tokens = THEMES[self.theme_name]
+        self.tokens = dict(THEMES[self.theme_name])
+        check_name = "check_dark.svg" if self.theme_name == "dark" else "check_white.svg"
+        self.tokens["CHECK_ICON"] = (ASSETS / check_name).as_posix()
 
         app = QApplication.instance()
         if app is not None:
@@ -2284,6 +2540,13 @@ class App(QMainWindow):
                 "brightness": int(self.brightness_slider.value()),
                 "speed": int(self.speed_slider.value()),
             },
+            "app": {
+                "autostart": bool(
+                    self.autostart_check.isChecked()
+                    if hasattr(self, "autostart_check")
+                    else False
+                ),
+            },
         }
         save_config(self.cfg)
 
@@ -2298,7 +2561,7 @@ class App(QMainWindow):
         box.setWindowTitle("О программе")
         box.setTextFormat(Qt.TextFormat.PlainText)
         box.setText(
-            "G102 Lightsync Control\n\n"
+            f"G102 Lightsync Control {APP_VERSION}\n\n"
             "Неофициальная панель управления мышью Logitech G102 / G203 "
             "через HID++ 2.0.\n"
             "Проект не связан с Logitech и не одобрен ею.\n\n"
@@ -2318,6 +2581,30 @@ class App(QMainWindow):
         bar.setValue(bar.maximum())
 
     def closeEvent(self, event) -> None:
+        if (
+            not self._quitting
+            and self.tray is not None
+            and self.tray.isVisible()
+        ):
+            event.ignore()
+            if self._intro_animation is not None:
+                self._intro_animation.stop()
+            self.setWindowOpacity(1.0)
+            self._persist()
+            self._settings.setValue("window/geometry", self.saveGeometry())
+            self._settings.sync()
+            self.hide()
+            if not self._tray_hint_shown:
+                self._tray_hint_shown = True
+                self.tray.showMessage(
+                    "G102 Lightsync Control",
+                    "Приложение свёрнуто в трей. Выход — через меню иконки.",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    3500,
+                )
+            return
+
+        self._quitting = True
         self._closing = True
         self._apply_timer.stop()
         self._save_timer.stop()
@@ -2328,6 +2615,9 @@ class App(QMainWindow):
 
         self._settings.setValue("window/geometry", self.saveGeometry())
         self._settings.sync()
+
+        if self.tray is not None:
+            self.tray.hide()
 
         self.pool.waitForDone(2500)
         try:

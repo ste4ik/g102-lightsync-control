@@ -19,7 +19,8 @@ The UI is built with **PySide6** (Qt 6) and follows the system light/dark appear
 - **Automatic apply** — every change is saved and sent to the mouse after a short pause; there is no Apply button.
 - **Polling rate** — 125 / 250 / 500 / 1000 Hz.
 - **Lighting** — Static, Breathing and Color Cycle; color via presets, HEX input or a color picker; brightness and speed control.
-- **Saved profile** — `config.json` next to the app is created automatically and re-applied when the mouse reconnects.
+- **Autostart and tray** — optional launch at Windows login; closing the window keeps the app in the notification area instead of quitting.
+- **Saved profile** — `config.json` is created automatically and re-applied when the mouse reconnects.
 - **Built-in diagnostics** — device log in the UI and a headless CLI (`python hid_backend.py`).
 - **No G HUB required** — G HUB can be uninstalled entirely.
 
@@ -35,9 +36,15 @@ The UI is built with **PySide6** (Qt 6) and follows the system light/dark appear
 
 ## Installation
 
+### Portable executable
+
+Download **`G102LightsyncControl.exe`** from the [latest release](https://github.com/ste4ik/g102-lightsync-control/releases/latest) and run it — Python is not required. The profile is stored in `%APPDATA%\G102 Lightsync Control\config.json`.
+
+### From source
+
 ```powershell
-git clone https://github.com/<your-username>/G102_Lightsync_Control.git
-cd G102_Lightsync_Control
+git clone https://github.com/ste4ik/g102-lightsync-control.git
+cd g102-lightsync-control
 python -m pip install -r requirements.txt
 ```
 
@@ -66,6 +73,8 @@ Optionally double-click `run.bat` (it changes to its own folder, runs the app an
 
 The app scans for the mouse on startup and, if found, connects and applies the saved profile automatically. Settings made in the UI are **applied automatically**: discrete changes after a short pause, sliders as soon as you release them. Every change is saved to `config.json` right away. If you ever need to force a sync, use **Устройство → Применить сейчас** (`Ctrl+Enter`).
 
+Closing the window (`X`) hides the app to the notification area instead of quitting: click the tray icon to bring it back, and use **Выход** in its menu to quit. Tick **Запускать при входе в Windows** in the **Приложение** section to start the app at login.
+
 ### Supported devices
 
 | USB PID | Model |
@@ -79,7 +88,7 @@ The mouse identifies itself by its USB product string, so the UI shows the name 
 
 ## Configuration
 
-`config.json` is created next to `main.py` (and is ignored by Git). Missing or invalid values fall back to safe defaults.
+`config.json` is created next to `main.py` when running from source. The portable build stores it in `%APPDATA%\G102 Lightsync Control\config.json`. Missing or invalid values fall back to safe defaults.
 
 ```json
 {
@@ -93,6 +102,9 @@ The mouse identifies itself by its USB product string, so the UI shows the name 
     "color": "#00E5A0",
     "brightness": 100,
     "speed": 60
+  },
+  "app": {
+    "autostart": false
   }
 }
 ```
@@ -106,6 +118,7 @@ The mouse identifies itself by its USB product string, so the UI shows the name 
 | `lighting.color` | `#RRGGBB` |
 | `lighting.brightness` | 1–100 |
 | `lighting.speed` | 1–100 (breathing/cycle only; static ignores it) |
+| `app.autostart` | Mirrors the `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` entry |
 
 ## Troubleshooting
 
@@ -170,17 +183,27 @@ References:
 ```
 G102_Lightsync_Control/
 ├── hid_backend.py    # HID++ 2.0: discovery, DPI, polling rate, RGB
-├── gui.py            # PySide6 UI + auto-apply + config.json handling
+├── gui.py            # PySide6 UI + auto-apply + tray/autostart + config handling
 ├── main.py           # entry point
 ├── requirements.txt
+├── build_exe.ps1     # one-file Windows build (PyInstaller)
 ├── run.bat           # Windows launcher
-├── assets/           # Lucide mouse SVG + generated app icon (PNG/ICO)
-├── tools/            # make_icon.py — regenerates the icon assets
+├── assets/           # Lucide mouse SVG, check marks, generated app icon (PNG/ICO)
+├── tools/            # make_icon.py, version_info.txt
 ├── LICENSE
 └── README.md
 ```
 
-`config.json` and `__pycache__/` are generated locally and ignored by Git.
+`config.json`, `build/`, `dist/` and `__pycache__/` are generated locally and ignored by Git.
+
+## Building an executable
+
+```powershell
+python -m pip install pyinstaller
+powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
+```
+
+The result is `dist\G102LightsyncControl.exe` — a single windowed file with the icon, Qt runtime and `assets/` bundled. The frozen build keeps its profile in `%APPDATA%\G102 Lightsync Control\`.
 
 ## Limitations
 
@@ -215,7 +238,8 @@ The UI runs on Qt via [PySide6](https://doc.qt.io/qtforpython-6/) (LGPLv3). The 
 - **Автоприменение** — каждое изменение сохраняется и уходит в мышь через короткую паузу; кнопки «Применить» нет.
 - **Частота опроса** — 125 / 250 / 500 / 1000 Гц.
 - **Подсветка** — статичная, «дыхание», цветовой цикл; цвет из пресетов, HEX или палитры; яркость и скорость.
-- **Профиль** — `config.json` создаётся автоматически рядом с программой и повторно применяется при подключении мыши.
+- **Автозапуск и трей** — по желанию запускается при входе в Windows; закрытие окна сворачивает приложение в трей, а не завершает его.
+- **Профиль** — `config.json` создаётся автоматически и повторно применяется при подключении мыши.
 - **Диагностика** — журнал в интерфейсе и консольный режим (`python hid_backend.py`).
 - **G HUB не нужен** — его можно полностью удалить.
 
@@ -229,9 +253,15 @@ The UI runs on Qt via [PySide6](https://doc.qt.io/qtforpython-6/) (LGPLv3). The 
 
 ## Установка
 
+### Готовый exe
+
+Скачайте **`G102LightsyncControl.exe`** из [последнего релиза](https://github.com/ste4ik/g102-lightsync-control/releases/latest) и запустите — Python не нужен. Профиль хранится в `%APPDATA%\G102 Lightsync Control\config.json`.
+
+### Из исходников
+
 ```powershell
-git clone https://github.com/<ваш-логин>/G102_Lightsync_Control.git
-cd G102_Lightsync_Control
+git clone https://github.com/ste4ik/g102-lightsync-control.git
+cd g102-lightsync-control
 python -m pip install -r requirements.txt
 ```
 
@@ -260,6 +290,8 @@ python main.py
 
 При старте программа сама ищет мышь и, если находит, подключается и применяет сохранённый профиль. Изменения в интерфейсе **применяются автоматически**: переключатели — через короткую паузу, ползунки — сразу после отпускания. Каждое изменение тут же сохраняется в `config.json`. Принудительно синхронизировать настройки можно через **«Устройство → Применить сейчас»** (`Ctrl+Enter`).
 
+Закрытие окна (`X`) сворачивает приложение в трей, а не завершает его: щёлкните по иконке, чтобы вернуть окно, а для выхода используйте **«Выход»** в меню трея. Галочка **«Запускать при входе в Windows»** в разделе **«Приложение»** добавляет приложение в автозапуск.
+
 ### Поддерживаемые устройства
 
 | PID | Модель |
@@ -273,7 +305,7 @@ python main.py
 
 ## Конфигурация
 
-`config.json` создаётся рядом с `main.py` (и исключён из Git). Отсутствующие или некорректные значения заменяются безопасными значениями по умолчанию.
+`config.json` создаётся рядом с `main.py` при запуске из исходников. Готовый exe хранит его в `%APPDATA%\G102 Lightsync Control\config.json`. Отсутствующие или некорректные значения заменяются безопасными значениями по умолчанию.
 
 ```json
 {
@@ -287,6 +319,9 @@ python main.py
     "color": "#00E5A0",
     "brightness": 100,
     "speed": 60
+  },
+  "app": {
+    "autostart": false
   }
 }
 ```
@@ -300,6 +335,7 @@ python main.py
 | `lighting.color` | `#RRGGBB` |
 | `lighting.brightness` | 1–100 |
 | `lighting.speed` | 1–100 (только для breathing/cycle; static её игнорирует) |
+| `app.autostart` | Дублирует запись в `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` |
 
 ## Если мышь не находится
 
@@ -352,17 +388,27 @@ Wave:       [cluster, effect_index, 0×6, period_hi, period_lo, direction, 0, pe
 ```
 G102_Lightsync_Control/
 ├── hid_backend.py    # HID++ 2.0: discovery, DPI, частота опроса, RGB
-├── gui.py            # PySide6 UI + автоприменение + работа с config.json
+├── gui.py            # PySide6 UI + автоприменение + трей/автозапуск + config.json
 ├── main.py           # точка входа
 ├── requirements.txt
+├── build_exe.ps1     # сборка одного exe (PyInstaller)
 ├── run.bat           # запуск в Windows
-├── assets/           # SVG мыши Lucide + готовые иконки приложения (PNG/ICO)
-├── tools/            # make_icon.py — пересборка иконок
+├── assets/           # SVG мыши Lucide, галочки, готовые иконки приложения (PNG/ICO)
+├── tools/            # make_icon.py, version_info.txt
 ├── LICENSE
 └── README.md
 ```
 
-`config.json` и `__pycache__/` создаются локально и исключены из Git.
+`config.json`, `build/`, `dist/` и `__pycache__/` создаются локально и исключены из Git.
+
+## Сборка exe
+
+```powershell
+python -m pip install pyinstaller
+powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
+```
+
+Результат — `dist\G102LightsyncControl.exe`: один файл без консольного окна, с иконкой, Qt-рантаймом и встроенной папкой `assets/`. Готовая сборка хранит профиль в `%APPDATA%\G102 Lightsync Control\`.
 
 ## Ограничения
 
