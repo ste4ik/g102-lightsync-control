@@ -1,9 +1,10 @@
-# G102 Lightsync Control
+# Lightsync Control — Logitech G102/G203 & Attack Shark X11
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4)
 ![License](https://img.shields.io/badge/license-MIT-2EE6A6)
 ![Protocol](https://img.shields.io/badge/protocol-HID%2B%2B%202.0%20%C2%B7%20Vendor%20HID-8B5CF6)
+![Devices](https://img.shields.io/badge/devices-G102%20%2F%20G203%20%2F%20X11-2EE6A6)
 
 A lightweight, driver-free replacement for vendor software for the **Logitech G102 / G203 Lightsync** (and **G203 Prodigy**) and the **Attack Shark X11** gaming mice. It talks to the mouse directly over **HID++ 2.0** (Logitech) or the mouse's **vendor HID feature-report protocol** (Attack Shark) using hidapi — no kernel driver, no libusb, no replacement of the system HID driver.
 
