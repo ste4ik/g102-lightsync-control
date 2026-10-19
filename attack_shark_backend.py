@@ -37,7 +37,7 @@ except ImportError as exc:  # pragma: no cover - only hit before pip install
         "Не найден модуль hid. Установите зависимости: pip install -r requirements.txt"
     ) from exc
 
-from hid_backend import DpiInfo, HidppError, LightingInfo
+from hid_backend import BatteryInfo, DpiInfo, HidppError, LightingInfo
 
 VENDOR_ID = 0x1D57
 WIRED_PID = 0xFA55
@@ -60,6 +60,15 @@ LEN_PERMISSION = 0x08
 
 EVENT_OPCODE = 0x03
 EVENT_FEATURE_STATUS = 0x50
+EVENT_BATTERY = 0x40
+EVENT_BATTERY_ALT = 0x41
+
+# Battery state byte in the device-connection event.
+BATTERY_STATUS = {
+    0x01: "normal",
+    0x02: "full",
+    0x03: "charging",
+}
 
 DPI_MIN = 50
 DPI_MAX = 26000
@@ -202,6 +211,8 @@ class AttackSharkX11:
         self._events = None
         self._owns_events = False
         self._lock = threading.RLock()
+        self._battery: Optional[BatteryInfo] = None
+        self._battery_at = 0.0
         self.pid: Optional[int] = None
         self.product = ""
         self.path = None
@@ -305,6 +316,8 @@ class AttackSharkX11:
             self._dev = dev
             self._events = None
             self._owns_events = False
+            self._battery = None
+            self._battery_at = 0.0
             self.pid = chosen.get("product_id")
             self.product = chosen.get("product_string") or SUPPORTED_PIDS.get(
                 self.pid, "Attack Shark X11"
@@ -329,6 +342,10 @@ class AttackSharkX11:
                 except Exception:
                     self._events = None
                     self._owns_events = False
+                else:
+                    # The device announces its battery right after a fresh
+                    # connection; keep whatever arrives while we set up.
+                    self._poll_events(0.35)
             return
 
         self._close_devices()
@@ -382,6 +399,41 @@ class AttackSharkX11:
                 "Переподключите мышь или закройте официальное ПО."
             )
 
+    # ----------------------------------------------------------------- events
+    def _handle_event(self, data: bytes) -> Optional[str]:
+        """Cache asynchronous device events (battery, acks, ...)."""
+        if len(data) < 5 or data[0] != EVENT_OPCODE:
+            return None
+        opcode = data[2]
+        if opcode in (EVENT_BATTERY, EVENT_BATTERY_ALT):
+            status = BATTERY_STATUS.get(data[3])
+            percentage = int(data[4])
+            if status is not None and 0 <= percentage <= 100:
+                self._battery = BatteryInfo(
+                    percentage=percentage,
+                    status=status,
+                )
+                self._battery_at = time.monotonic()
+                return "battery"
+        return None
+
+    def _poll_events(self, duration: float = 0.3) -> None:
+        """Read pending interrupts for a short while without blocking the app."""
+        if self._events is None:
+            return
+        deadline = time.monotonic() + max(0.0, duration)
+        while True:
+            try:
+                data = self._events.read(5, 0)
+            except Exception:
+                return
+            if data:
+                self._handle_event(bytes(data))
+                continue
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(0.01)
+
     def _drain_events(self) -> None:
         if self._events is None:
             return
@@ -392,6 +444,7 @@ class AttackSharkX11:
                 return
             if not data:
                 return
+            self._handle_event(bytes(data))
 
     def _wait_ack(self, report_id: int, timeout: float = 0.6) -> None:
         if self._events is None:
@@ -407,6 +460,7 @@ class AttackSharkX11:
                 time.sleep(0.01)
                 continue
             data = bytes(data)
+            self._handle_event(data)
             if (
                 len(data) >= 5
                 and data[2] == EVENT_FEATURE_STATUS
@@ -677,6 +731,18 @@ class AttackSharkX11:
 
         length = 13 if self.wired else LEN_LIGHTING
         self._send_command(buffer[:length], REPORT_LIGHTING)
+
+    # ---------------------------------------------------------------- battery
+    def get_battery_info(self, refresh: bool = True) -> Optional[BatteryInfo]:
+        """Return the last battery event, listening briefly for a new one.
+
+        The X11 reports its charge asynchronously (event 0x40/0x41); there is
+        no request report for it, so this only sees events that arrive while
+        the event interface is open.
+        """
+        if refresh:
+            self._poll_events(0.3)
+        return self._battery
 
     # -------------------------------------------------------------- onboarding
     def get_onboard_mode(self) -> int:

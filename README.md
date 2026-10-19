@@ -23,6 +23,7 @@ The UI is built with **PySide6** (Qt 6), adapts its layout to the window width, 
 - **Lighting** — Static, Breathing and Color Cycle; color via presets, HEX input or a color picker; brightness and speed control.
 - **Light, dark and system themes** — switch from the **appearance menu** or the segmented control in the **Application** section; the choice is saved.
 - **Adaptive layout** — the settings column and the device/log panel sit side by side on wide windows and stack vertically on narrow ones.
+- **Battery level and low-battery alerts** — the wireless X11 reports its charge in the device card (refreshed every minute) and can raise a native Windows notification once the charge reaches a configurable threshold (5–50%).
 - **Autostart and tray** — optional launch at Windows login; closing the window keeps the app in the notification area instead of quitting.
 - **Saved profile** — `config.json` is created automatically and re-applied when the mouse reconnects.
 - **Built-in diagnostics** — device log in the UI and headless CLIs (`python device_backend.py`, `python hid_backend.py`, `python attack_shark_backend.py`).
@@ -119,7 +120,9 @@ The mouse identifies itself by its USB product string, so the UI shows the name 
   "app": {
     "autostart": false,
     "theme": "system",
-    "last_device": ""
+    "last_device": "",
+    "battery_notifications": true,
+    "battery_threshold": 20
   }
 }
 ```
@@ -136,6 +139,8 @@ The mouse identifies itself by its USB product string, so the UI shows the name 
 | `app.autostart` | Mirrors the `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` entry |
 | `app.theme` | `system`, `light` or `dark` |
 | `app.last_device` | Last successfully opened backend (`logitech` or `attack_shark`), used to pick the device when both are present |
+| `app.battery_notifications` | Show a native Windows notification when the wireless X11 charge reaches the threshold |
+| `app.battery_threshold` | Low-battery threshold in percent, clamped to 5–50 (default `20`) |
 
 ## Troubleshooting
 
@@ -205,6 +210,7 @@ The X11 uses vendor HID **feature reports** (not HID++). The app opens interface
 - **DPI** — the PAW3311 sensor uses a 50-step lookup table; slots are read back, modified (only the presets and active slot are touched) and written, so unrelated settings such as lift-off, ripple control and debounce are preserved.
 - **Lighting** — mode in the high nibble of byte 3 (`0x1` static, `0x2` breathing, `0x3` neon/cycle), brightness 1–8, LED speed 1–5, RGB in bytes 6–8. The buffer is read first and unrelated fields are kept.
 - **Polling** — `125 → 0x08`, `250 → 0x04`, `500 → 0x02`, `1000 → 0x01`.
+- **Battery** — the mouse pushes a 5-byte event `[0x03, device_id, 0x40, status, percent]` (`0x41` is accepted too); status `0x01` normal, `0x02` fully charged, `0x03` charging, percent 0–100. There is no request report, so the app listens on the event interface, polls briefly when opening it, and refreshes every 60 seconds.
 
 The protocol implementation is based on [HarukaYamamoto0/attack-shark-x11-driver](https://github.com/HarukaYamamoto0/attack-shark-x11-driver/).
 
@@ -222,7 +228,7 @@ G102_Lightsync_Control/
 ├── device_backend.py       # unified detection/selection of supported mice
 ├── hid_backend.py          # Logitech HID++ 2.0: discovery, DPI, polling rate, RGB
 ├── attack_shark_backend.py # Attack Shark X11 vendor HID protocol
-├── gui.py                  # PySide6 UI + themes + responsive layout + tray/autostart
+├── gui.py                  # PySide6 UI + themes + responsive layout + tray/battery alerts
 ├── main.py                 # entry point
 ├── requirements.txt
 ├── build_exe.ps1     # one-file Windows build (PyInstaller)
@@ -253,6 +259,7 @@ The result is `dist\G102LightsyncControl.exe` — a single windowed file with th
 - `0x8070` (legacy lighting) is implemented only as a basic fallback and is far less tested than `0x8071`.
 - The X11 backend was written against the reference driver's protocol and has not been validated on every firmware revision. The X11 exposes only Static, Breathing and Neon (color cycle) through this app, and brightness/speed are quantized to the device's 1–8 / 1–5 steps.
 - On the X11, DPI values above 20,000 share their encoded bytes with ordinary values in the reference format, so the value read back from the device after reconnecting may differ from the preset. Values up to 20,000 round-trip exactly (or within the 50 DPI step).
+- X11 battery reports are **asynchronous**: the app cannot request them on demand. The first report after connecting may briefly show 100% before the real value, so the charge is refreshed every minute. Battery display and low-battery notifications apply to the wireless X11 only — the wired variant and the G102/G203 have no battery.
 - No automated tests or CI yet.
 
 ## Contributing
@@ -284,6 +291,7 @@ The UI runs on Qt via [PySide6](https://doc.qt.io/qtforpython-6/) (LGPLv3). The 
 - **Подсветка** — статичная, «дыхание», цветовой цикл; цвет из пресетов, HEX или палитры; яркость и скорость.
 - **Светлая, тёмная и системная темы** — переключаются в меню оформления или сегментом в разделе «Приложение»; выбор сохраняется.
 - **Адаптивная раскладка** — на широком окне настройки и панель устройства/журнала стоят рядом, на узком — друг под другом.
+- **Заряд батареи и уведомления** — беспроводной X11 показывает заряд в карточке устройства (обновляется раз в минуту), а при снижении до настраиваемого порога (5–50%) Windows один раз показывает нативное уведомление.
 - **Автозапуск и трей** — по желанию запускается при входе в Windows; закрытие окна сворачивает приложение в трей, а не завершает его.
 - **Профиль** — `config.json` создаётся автоматически и повторно применяется при подключении мыши.
 - **Диагностика** — журнал в интерфейсе и консольные режимы (`python device_backend.py`, `python hid_backend.py`, `python attack_shark_backend.py`).
@@ -378,7 +386,9 @@ python main.py
   "app": {
     "autostart": false,
     "theme": "system",
-    "last_device": ""
+    "last_device": "",
+    "battery_notifications": true,
+    "battery_threshold": 20
   }
 }
 ```
@@ -395,6 +405,8 @@ python main.py
 | `app.autostart` | Дублирует запись в `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` |
 | `app.theme` | `system`, `light` или `dark` |
 | `app.last_device` | Последний успешно открытый backend (`logitech` или `attack_shark`), используется для выбора мыши, если подключены обе |
+| `app.battery_notifications` | Показывать нативное уведомление Windows, когда заряд беспроводного X11 достигает порога |
+| `app.battery_threshold` | Порог низкого заряда в процентах, ограничен 5–50 (по умолчанию `20`) |
 
 ## Если мышь не находится
 
@@ -452,6 +464,7 @@ X11 общается через вендорные HID **feature reports** (не
 - **DPI** — сенсор PAW3311 использует таблицу с шагом 50. Слоты читаются, изменяются (только пресеты и активный слот) и записываются обратно, поэтому посторонние настройки — lift-off, ripple control, debounce — сохраняются.
 - **Подсветка** — режим в старшем полубайте байта 3 (`0x1` static, `0x2` breathing, `0x3` neon/cycle), яркость 1–8, скорость LED 1–5, RGB в байтах 6–8. Буфер сначала читается, посторонние поля сохраняются.
 - **Частота опроса** — `125 → 0x08`, `250 → 0x04`, `500 → 0x02`, `1000 → 0x01`.
+- **Заряд** — мышь сама присылает 5-байтовое событие `[0x03, device_id, 0x40, status, percent]` (`0x41` тоже принимается); status `0x01` — норма, `0x02` — полностью заряжено, `0x03` — идёт зарядка, percent 0–100. Запроса на чтение нет, поэтому приложение слушает интерфейс событий, коротко опрашивает его при открытии и обновляет заряд каждые 60 секунд.
 
 Реализация протокола основана на [HarukaYamamoto0/attack-shark-x11-driver](https://github.com/HarukaYamamoto0/attack-shark-x11-driver/).
 
@@ -500,6 +513,7 @@ powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
 - `0x8070` (legacy-подсветка) реализован только как базовый fallback и протестирован гораздо хуже, чем `0x8071`.
 - Backend X11 написан по протоколу референсного драйвера и не проверялся на каждой ревизии прошивки. Через приложение X11 поддерживает только статичную подсветку, «дыхание» и неон (цветовой цикл), а яркость и скорость квантуются в шаги устройства 1–8 / 1–5.
 - У X11 значения DPI выше 20 000 в референсном формате кодируются теми же байтами, что и обычные значения, поэтому прочитанное из устройства значение после переподключения может отличаться от пресета. Значения до 20 000 читаются точно (или с точностью до шага 50).
+- Заряд X11 приходит **асинхронно**: запросить его по команде нельзя. Первый отчёт после подключения может на секунду показать 100% вместо реального значения, поэтому заряд обновляется раз в минуту. Показ заряда и уведомления относятся только к беспроводному X11 — у проводного варианта и G102/G203 батареи нет.
 - Автотестов и CI пока нет.
 
 ## Участие в разработке

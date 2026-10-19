@@ -8,8 +8,11 @@ Both backends expose the same small interface used by the GUI:
     get_polling_rate() / set_polling_rate(hz)
     get_lighting_info() / set_lighting(mode, rgb, brightness, speed)
     get_onboard_mode()
+    get_battery_info()
 
 The Attack Shark X11 backend also implements set_dpi() for convenience.
+get_battery_info() returns a BatteryInfo for wireless mice and None for
+wired devices (the G102/G203 has no battery).
 """
 
 from __future__ import annotations

@@ -104,6 +104,22 @@ class LightingInfo:
     effects: Dict[int, int]  # effect_id -> cluster effect index
 
 
+@dataclass(frozen=True)
+class BatteryInfo:
+    """Battery state reported by wireless devices."""
+
+    percentage: int
+    status: str  # "normal", "charging" or "full"
+
+    @property
+    def charging(self) -> bool:
+        return self.status in ("charging", "full")
+
+    @property
+    def full(self) -> bool:
+        return self.status == "full"
+
+
 class G102Mouse:
     """Small, thread-safe HID++ 2.0 client."""
 
@@ -417,6 +433,11 @@ class G102Mouse:
             return
         index = max(0, min(len(levels) - 1, int(active_index)))
         self.set_dpi(int(levels[index]))
+
+    # ---------------------------------------------------------------- battery
+    def get_battery_info(self) -> Optional[BatteryInfo]:
+        """The G102/G203 is wired only: it has no battery to report."""
+        return None
 
     # ------------------------------------------------------------ polling rate
     def get_supported_polling_rates(self) -> List[int]:

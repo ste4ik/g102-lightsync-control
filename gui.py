@@ -70,18 +70,19 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSlider,
+    QSpinBox,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
 
 from device_backend import BACKEND_LABELS, enumerate_devices, open_preferred
-from hid_backend import DpiInfo, HidppError
+from hid_backend import BatteryInfo, DpiInfo, HidppError
 
 ROOT = Path(__file__).resolve().parent
 ASSETS = ROOT / "assets"
 
-APP_VERSION = "1.3"
+APP_VERSION = "1.4"
 AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 AUTOSTART_NAME = "G102 Lightsync Control"
 
@@ -122,6 +123,8 @@ DEFAULT_CONFIG = {
         "autostart": False,
         "theme": "system",
         "last_device": "",
+        "battery_notifications": True,
+        "battery_threshold": 20,
     },
 }
 
@@ -486,6 +489,27 @@ QLineEdit#dpiEntry[active="true"] {
     border-color: $ACCENT_BORDER;
 }
 
+QSpinBox {
+    background: $FIELD;
+    color: $TEXT;
+    border: 1px solid $BORDER;
+    border-radius: 6px;
+    padding: 3px 6px;
+    min-width: 64px;
+}
+QSpinBox:focus {
+    border-color: $ACCENT;
+}
+QSpinBox:disabled {
+    color: $TEXT_3;
+    border-color: $BORDER;
+}
+QSpinBox::up-button, QSpinBox::down-button {
+    width: 16px;
+    background: transparent;
+    border: none;
+}
+
 QScrollArea {
     background: transparent;
     border: none;
@@ -736,6 +760,14 @@ def load_config() -> dict:
     app_cfg["theme"] = theme if theme in THEME_TO_LABEL else "system"
     device = str(app_cfg.get("last_device", "")).lower()
     app_cfg["last_device"] = device if device in BACKEND_LABELS else ""
+    app_cfg["battery_notifications"] = bool(
+        app_cfg.get("battery_notifications", True)
+    )
+    try:
+        threshold = int(app_cfg.get("battery_threshold", 20))
+    except (TypeError, ValueError):
+        threshold = 20
+    app_cfg["battery_threshold"] = max(5, min(50, threshold))
 
     return config
 
@@ -1326,6 +1358,13 @@ class App(QMainWindow):
         self.color_hex = str(self.cfg["lighting"]["color"])
         self.brightness = int(self.cfg["lighting"]["brightness"])
         self.speed = int(self.cfg["lighting"]["speed"])
+        self.battery_notifications = bool(
+            self.cfg.get("app", {}).get("battery_notifications", True)
+        )
+        self.battery_threshold = int(
+            self.cfg.get("app", {}).get("battery_threshold", 20)
+        )
+        self._battery_warned = False
 
         self.tokens = LIGHT
         self.theme_name = "light"
@@ -1352,6 +1391,10 @@ class App(QMainWindow):
         self._status_timer = QTimer(self)
         self._status_timer.setSingleShot(True)
         self._status_timer.timeout.connect(self._restore_status)
+
+        self._battery_timer = QTimer(self)
+        self._battery_timer.setInterval(60_000)
+        self._battery_timer.timeout.connect(self._poll_battery)
 
         self.setWindowTitle("Lightsync Control")
         self.setWindowIcon(load_app_icon())
@@ -2130,6 +2173,70 @@ class App(QMainWindow):
         theme_hint.setWordWrap(True)
         layout.addWidget(theme_hint)
 
+        layout.addSpacing(12)
+        battery_label = QLabel("Уведомления о заряде")
+        battery_label.setObjectName("fieldLabel")
+        layout.addWidget(battery_label)
+        layout.addSpacing(4)
+
+        self.battery_notify_check = QCheckBox("Предупреждать о низком заряде")
+        self.battery_notify_check.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.battery_notify_check.setChecked(self.battery_notifications)
+        self.battery_notify_check.toggled.connect(
+            self._on_battery_notifications_toggled
+        )
+        layout.addWidget(self.battery_notify_check)
+
+        threshold_row = QWidget()
+        threshold_layout = QHBoxLayout(threshold_row)
+        threshold_layout.setContentsMargins(0, 2, 0, 0)
+        threshold_layout.setSpacing(8)
+        threshold_label = QLabel("Порог уведомления")
+        threshold_layout.addWidget(threshold_label)
+        threshold_layout.addStretch(1)
+        self.battery_threshold_spin = QSpinBox()
+        self.battery_threshold_spin.setRange(5, 50)
+        self.battery_threshold_spin.setSingleStep(5)
+        self.battery_threshold_spin.setSuffix(" %")
+        self.battery_threshold_spin.setValue(self.battery_threshold)
+        self.battery_threshold_spin.setEnabled(self.battery_notifications)
+        self.battery_threshold_spin.valueChanged.connect(
+            self._on_battery_threshold_changed
+        )
+        threshold_layout.addWidget(self.battery_threshold_spin)
+        layout.addWidget(threshold_row)
+
+        battery_hint = QLabel(
+            "Работает для Attack Shark X11: заряд показывается в карточке "
+            "устройства, а при снижении до порога Windows один раз покажет "
+            "нативное уведомление. После подзарядки выше порога оно включится снова."
+        )
+        battery_hint.setObjectName("hint")
+        battery_hint.setWordWrap(True)
+        layout.addWidget(battery_hint)
+
+    def _on_battery_notifications_toggled(self, checked: bool) -> None:
+        enabled = bool(checked)
+        self.battery_notifications = enabled
+        self._battery_warned = False
+        if hasattr(self, "battery_threshold_spin"):
+            self.battery_threshold_spin.setEnabled(enabled)
+        if self._loading:
+            return
+        self._persist()
+        self._log(
+            "Уведомления о низком заряде включены."
+            if enabled
+            else "Уведомления о низком заряде выключены."
+        )
+
+    def _on_battery_threshold_changed(self, value: int) -> None:
+        self.battery_threshold = int(value)
+        self._battery_warned = False
+        if self._loading:
+            return
+        self._save_timer.start(400)
+
     def _on_theme_segment(self, label: str) -> None:
         self._set_theme_mode(LABEL_TO_THEME.get(label, "system"))
 
@@ -2325,6 +2432,20 @@ class App(QMainWindow):
         self.light_readout.setObjectName("metricText")
         self.light_readout.setWordWrap(True)
         readout_layout.addWidget(self.light_readout)
+
+        self.battery_box = QWidget()
+        battery_layout = QVBoxLayout(self.battery_box)
+        battery_layout.setContentsMargins(0, 8, 0, 0)
+        battery_layout.setSpacing(0)
+        battery_label = QLabel("Заряд батареи")
+        battery_label.setObjectName("metricLabel")
+        battery_layout.addWidget(battery_label)
+        self.battery_readout = QLabel("—")
+        self.battery_readout.setObjectName("metric")
+        battery_layout.addWidget(self.battery_readout)
+        self.battery_box.setVisible(False)
+        readout_layout.addWidget(self.battery_box)
+
         readout_layout.addStretch(1)
 
         stage_layout.addWidget(readouts, 1)
@@ -2492,6 +2613,7 @@ class App(QMainWindow):
     def connect(self) -> None:
         if self._closing:
             return
+        self._battery_timer.stop()
         self._set_status("Подключение…", "busy")
         self.connect_btn.setEnabled(False)
         self.connect_btn.setText("Подключение…")
@@ -2537,6 +2659,8 @@ class App(QMainWindow):
         self.connect_btn.setEnabled(True)
         self.connect_btn.setText("Переподключить")
         self.device_name_label.setText(product)
+        if self.tray is not None:
+            self.tray.setToolTip(f"Lightsync Control · {product}")
         meta = [f"PID 0x{pid:04X}" + (f" · {connection}" if connection else "")]
         meta.append(f"Сенсор {dpi.minimum}–{dpi.maximum} DPI · шаг {dpi.step}")
         meta.append(f"На мыши: {dpi.current} DPI · {rate} Гц")
@@ -2556,6 +2680,11 @@ class App(QMainWindow):
                     "Уровни DPI в профиле мыши: "
                     + ", ".join(str(value) for value in dpi.levels)
                 )
+            if not getattr(mouse, "wired", False):
+                self._log(
+                    "Заряд батареи обновляется по событиям мыши раз в минуту; "
+                    "порог уведомления — в разделе «Приложение»."
+                )
         elif lighting:
             effects = ", ".join(
                 f"0x{effect_id:02X}→{index}"
@@ -2574,6 +2703,18 @@ class App(QMainWindow):
                 "переключится в host-режим (иначе polling rate не меняется)."
             )
 
+        self._battery_timer.stop()
+        self._battery_warned = False
+        show_battery = self.backend_key == "attack_shark" and not getattr(
+            mouse, "wired", False
+        )
+        if hasattr(self, "battery_box"):
+            self.battery_readout.setText("—")
+            self.battery_box.setVisible(show_battery)
+        if show_battery:
+            self._battery_timer.start()
+            QTimer.singleShot(500, self._poll_battery)
+
         self._apply_device_limits(dpi)
         self.cfg.setdefault("app", {})["last_device"] = self.backend_key
         self._apply_pending = False
@@ -2584,6 +2725,78 @@ class App(QMainWindow):
         self.connect_btn.setEnabled(True)
         self.connect_btn.setText("Подключить мышь")
         self._set_status("Не подключено", "error")
+        self._battery_timer.stop()
+        if hasattr(self, "battery_box"):
+            self.battery_box.setVisible(False)
+
+    # ---------------------------------------------------------------- battery
+    def _poll_battery(self) -> None:
+        if self._closing or self.mouse is None or self._applying:
+            return
+        if self.backend_key != "attack_shark":
+            return
+        if not getattr(self.mouse, "connected", True):
+            return
+        self._run(
+            self.mouse.get_battery_info,
+            on_success=self._on_battery,
+            quiet=True,
+        )
+
+    def _on_battery(self, info: BatteryInfo | None) -> None:
+        if self._closing or self.backend_key != "attack_shark":
+            return
+        if info is None:
+            return
+        status = ""
+        if info.status == "charging":
+            status = " · зарядка"
+        elif info.status == "full":
+            status = " · заряжено"
+        if hasattr(self, "battery_readout"):
+            self.battery_readout.setText(f"{info.percentage}%{status}")
+            self.battery_box.setVisible(True)
+        if self.tray is not None:
+            self.tray.setToolTip(
+                f"Lightsync Control · {self._last_product or 'мышь'} · "
+                f"заряд {info.percentage}%"
+            )
+        self._maybe_notify_battery(info)
+
+    def _maybe_notify_battery(self, info: BatteryInfo) -> None:
+        threshold = int(self.battery_threshold)
+        # Re-arm once the battery is clearly above the threshold or charging.
+        if info.charging or info.full or info.percentage > min(100, threshold + 3):
+            self._battery_warned = False
+            return
+        if not self.battery_notifications or self._battery_warned:
+            return
+        if info.percentage > threshold:
+            return
+
+        self._battery_warned = True
+        product = self._last_product or "Attack Shark X11"
+        message = (
+            f"{product}: осталось {info.percentage}%. "
+            "Пора поставить мышь на зарядку."
+        )
+        shown = False
+        if self.tray is not None and self.tray.isVisible():
+            self.tray.showMessage(
+                "Низкий заряд мыши",
+                message,
+                QSystemTrayIcon.MessageIcon.Warning,
+                10_000,
+            )
+            shown = True
+        self._log(
+            f"Низкий заряд: {info.percentage}% (порог {threshold}%)."
+            + (
+                ""
+                if shown
+                else " Уведомление Windows недоступно — сообщение только в журнале."
+            )
+        )
 
     def _auto_connect(self) -> None:
         if self._closing or os.environ.get("G102_NO_AUTOCONNECT") == "1":
@@ -2781,6 +2994,8 @@ class App(QMainWindow):
                 ),
                 "theme": self.theme_mode,
                 "last_device": self.backend_key or self.cfg.get("app", {}).get("last_device", ""),
+                "battery_notifications": bool(self.battery_notifications),
+                "battery_threshold": int(self.battery_threshold),
             },
         }
         save_config(self.cfg)
@@ -2846,6 +3061,7 @@ class App(QMainWindow):
         self._apply_timer.stop()
         self._save_timer.stop()
         self._status_timer.stop()
+        self._battery_timer.stop()
         if self._intro_animation is not None:
             self._intro_animation.stop()
         self._persist()
