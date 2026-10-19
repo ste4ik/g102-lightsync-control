@@ -1,5 +1,5 @@
 """
-Qt (PySide6) interface for the Logitech G102 / G203 Lightsync.
+Qt (PySide6) interface for the Logitech G102 / G203 Lightsync and Attack Shark X11.
 
 Settings apply automatically: every change is written to config.json and pushed
 to the mouse after a short pause. Run:  python main.py
@@ -53,6 +53,7 @@ from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractButton,
     QApplication,
+    QBoxLayout,
     QButtonGroup,
     QCheckBox,
     QColorDialog,
@@ -74,14 +75,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from hid_backend import G102Mouse, HidppError
+from device_backend import BACKEND_LABELS, enumerate_devices, open_preferred
+from hid_backend import DpiInfo, HidppError
 
 ROOT = Path(__file__).resolve().parent
 ASSETS = ROOT / "assets"
 
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 AUTOSTART_NAME = "G102 Lightsync Control"
+
+DPI_FLOOR = 50
+DPI_CEILING = 26000
+DPI_STEP = 50
 
 
 def _data_dir() -> Path:
@@ -114,6 +120,8 @@ DEFAULT_CONFIG = {
     },
     "app": {
         "autostart": False,
+        "theme": "system",
+        "last_device": "",
     },
 }
 
@@ -129,6 +137,13 @@ MODE_HINT = {
     "breathing": "Плавно пульсирует выбранным цветом.",
     "cycle": "Переливается всеми цветами радуги — цвет не выбирается.",
 }
+
+THEME_TO_LABEL = {
+    "system": "Системная",
+    "light": "Светлая",
+    "dark": "Тёмная",
+}
+LABEL_TO_THEME = {label: mode for mode, label in THEME_TO_LABEL.items()}
 
 POLLING_RATES = [125, 250, 500, 1000]
 
@@ -672,7 +687,15 @@ def load_config() -> dict:
     raw_levels = dpi.get("levels")
     for value in raw_levels if isinstance(raw_levels, list) else []:
         try:
-            levels.append(max(200, min(8000, int(round(int(value) / 50) * 50))))
+            levels.append(
+                max(
+                    DPI_FLOOR,
+                    min(
+                        DPI_CEILING,
+                        int(round(int(value) / DPI_STEP) * DPI_STEP),
+                    ),
+                )
+            )
         except (TypeError, ValueError):
             continue
     dpi["levels"] = levels or list(DEFAULT_CONFIG["dpi"]["levels"])
@@ -709,6 +732,10 @@ def load_config() -> dict:
         app_cfg = {}
         config["app"] = app_cfg
     app_cfg["autostart"] = bool(app_cfg.get("autostart", False))
+    theme = str(app_cfg.get("theme", "system")).lower()
+    app_cfg["theme"] = theme if theme in THEME_TO_LABEL else "system"
+    device = str(app_cfg.get("last_device", "")).lower()
+    app_cfg["last_device"] = device if device in BACKEND_LABELS else ""
 
     return config
 
@@ -1265,7 +1292,12 @@ class App(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.cfg = load_config()
-        self.mouse = G102Mouse()
+        self.mouse = None
+        self.backend_key = ""
+        self.max_levels = None
+        self.dpi_min = DPI_FLOOR
+        self.dpi_max = DPI_CEILING
+        self.dpi_step = DPI_STEP
         self._settings = QSettings("G102 Lightsync Control", "G102 Lightsync Control")
 
         self._loading = True
@@ -1286,6 +1318,7 @@ class App(QMainWindow):
         self.tray: QSystemTrayIcon | None = None
         self.tray_menu: QMenu | None = None
         self.tray_autostart_action: QAction | None = None
+        self._narrow: bool | None = None
 
         self.active_index = int(self.cfg["dpi"]["active_level"])
         self.poll_rate = int(self.cfg["polling_rate"])
@@ -1296,6 +1329,9 @@ class App(QMainWindow):
 
         self.tokens = LIGHT
         self.theme_name = "light"
+        self.theme_mode = str(self.cfg.get("app", {}).get("theme", "system"))
+        if self.theme_mode not in THEME_TO_LABEL:
+            self.theme_mode = "system"
 
         try:
             self._svg_text = (ASSETS / "mouse.svg").read_text(encoding="utf-8")
@@ -1317,9 +1353,9 @@ class App(QMainWindow):
         self._status_timer.setSingleShot(True)
         self._status_timer.timeout.connect(self._restore_status)
 
-        self.setWindowTitle("G102 Lightsync Control")
+        self.setWindowTitle("Lightsync Control")
         self.setWindowIcon(load_app_icon())
-        self.setMinimumSize(920, 700)
+        self.setMinimumSize(420, 560)
 
         geometry = self._settings.value("window/geometry")
         if geometry is None or not self.restoreGeometry(geometry):
@@ -1331,8 +1367,11 @@ class App(QMainWindow):
         self._sync_stage()
         self._setup_tray()
 
-        self._log("Закройте Logitech G HUB перед подключением: он занимает интерфейс HID++.")
-        self._log("Настройки применяются автоматически. Мышь подключается сама, если она найдена.")
+        self._log("Поддерживаются Logitech G102/G203 Lightsync и Attack Shark X11.")
+        self._log(
+            "Для Logitech закройте G HUB: он занимает интерфейс HID++. "
+            "Настройки применяются автоматически."
+        )
 
         self._set_status("Не подключено", "idle")
         self._loading = False
@@ -1365,6 +1404,19 @@ class App(QMainWindow):
         device.addAction(apply_action)
 
         device.addSeparator()
+        theme_menu = device.addMenu("Тема оформления")
+        self.theme_actions: dict[str, QAction] = {}
+        for mode, label in THEME_TO_LABEL.items():
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(mode == self.theme_mode)
+            action.triggered.connect(
+                lambda _checked=False, chosen=mode: self._set_theme_mode(chosen)
+            )
+            theme_menu.addAction(action)
+            self.theme_actions[mode] = action
+
+        device.addSeparator()
         quit_action = QAction("Выход", self)
         quit_action.setShortcut(QKeySequence.StandardKey.Quit)
         quit_action.triggered.connect(self._quit)
@@ -1390,6 +1442,7 @@ class App(QMainWindow):
         outer = QVBoxLayout(central)
         outer.setContentsMargins(24, 12, 24, 16)
         outer.setSpacing(0)
+        self.outer_layout = outer
 
         header = QWidget()
         header.setObjectName("header")
@@ -1400,14 +1453,17 @@ class App(QMainWindow):
         titles = QVBoxLayout()
         titles.setContentsMargins(0, 0, 0, 0)
         titles.setSpacing(1)
-        title = QLabel("G102 Lightsync")
+        title = QLabel("Lightsync Control")
         title.setObjectName("title")
-        subtitle = QLabel("Панель управления  ·  HID++ 2.0  ·  изменения применяются автоматически")
+        subtitle = QLabel(
+            "Logitech G102 / G203 и Attack Shark X11  ·  настройки применяются автоматически"
+        )
         subtitle.setObjectName("subtitle")
+        subtitle.setWordWrap(True)
+        self.header_subtitle = subtitle
         titles.addWidget(title)
         titles.addWidget(subtitle)
-        header_layout.addLayout(titles)
-        header_layout.addStretch(1)
+        header_layout.addLayout(titles, 1)
 
         status_layout = QHBoxLayout()
         status_layout.setContentsMargins(0, 0, 0, 0)
@@ -1434,6 +1490,7 @@ class App(QMainWindow):
         body_layout.setContentsMargins(0, 0, 0, 0)
         body_layout.setSpacing(18)
         outer.addWidget(body, 1)
+        self.body_layout = body_layout
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -1459,6 +1516,7 @@ class App(QMainWindow):
         inspector_layout.setContentsMargins(0, 0, 0, 0)
         inspector_layout.setSpacing(16)
         body_layout.addWidget(inspector, 2)
+        self.inspector = inspector
 
         self._build_dpi_section(self.settings_layout)
         self._build_polling_section(self.settings_layout)
@@ -1471,6 +1529,33 @@ class App(QMainWindow):
 
         self._refresh_dpi_rows()
         self._update_remove_state()
+        self._apply_responsive_layout(self.width())
+
+    # ------------------------------------------------------------- responsive
+    def _apply_responsive_layout(self, width: int) -> None:
+        """Stack the settings and inspector vertically on narrow windows."""
+        narrow = width < 980
+        if narrow == self._narrow:
+            return
+        self._narrow = narrow
+
+        direction = (
+            QBoxLayout.Direction.TopToBottom
+            if narrow
+            else QBoxLayout.Direction.LeftToRight
+        )
+        self.body_layout.setDirection(direction)
+        self.body_layout.setSpacing(12 if narrow else 18)
+
+        margin = (14, 8, 14, 12) if narrow else (24, 12, 24, 16)
+        self.outer_layout.setContentsMargins(*margin)
+        self.scroll.setMinimumWidth(0 if narrow else 430)
+        self.inspector.setMinimumWidth(0 if narrow else 380)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        super().resizeEvent(event)
+        if hasattr(self, "body_layout"):
+            self._apply_responsive_layout(event.size().width())
 
     def _section(self, parent_layout: QVBoxLayout, title: str, caption: str | None = None) -> QFrame:
         container = QWidget()
@@ -1524,6 +1609,7 @@ class App(QMainWindow):
         add_button.setMinimumHeight(28)
         add_button.clicked.connect(self._add_level)
         footer_layout.addWidget(add_button)
+        self.add_btn = add_button
 
         self.remove_btn = QPushButton("Удалить уровень")
         self.remove_btn.setObjectName("ghost")
@@ -1562,16 +1648,16 @@ class App(QMainWindow):
         )
 
         slider = QSlider(Qt.Orientation.Horizontal)
-        slider.setRange(200, 8000)
-        slider.setSingleStep(50)
-        slider.setPageStep(400)
-        slider.setValue(int(dpi))
+        slider.setRange(self.dpi_min, self.dpi_max)
+        slider.setSingleStep(self.dpi_step)
+        slider.setPageStep(max(self.dpi_step, 400))
+        slider.setValue(self._clamp_dpi(dpi))
         slider.setMinimumWidth(90)
         slider.setFixedHeight(24)
         slider.valueChanged.connect(lambda value, i=index: self._on_dpi_slider(i, value))
         slider.sliderReleased.connect(self._commit_slider)
 
-        entry = QLineEdit(str(dpi))
+        entry = QLineEdit(str(self._clamp_dpi(dpi)))
         entry.setObjectName("dpiEntry")
         entry.setFixedSize(72, 28)
         entry.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1596,7 +1682,7 @@ class App(QMainWindow):
                 "radio": radio,
                 "slider": slider,
                 "entry": entry,
-                "value": int(dpi),
+                "value": self._clamp_dpi(dpi),
             }
         )
 
@@ -1604,6 +1690,15 @@ class App(QMainWindow):
             radio.blockSignals(True)
             radio.setChecked(True)
             radio.blockSignals(False)
+
+    def _clamp_dpi(self, value: int) -> int:
+        step = max(1, int(self.dpi_step or DPI_STEP))
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            number = self.dpi_min
+        number = int(round(number / step) * step)
+        return max(self.dpi_min, min(self.dpi_max, number))
 
     def _refresh_dpi_rows(self) -> None:
         for index, row in enumerate(self.dpi_rows):
@@ -1628,7 +1723,7 @@ class App(QMainWindow):
     def _on_dpi_slider(self, index: int, value: int) -> None:
         if self._loading or index >= len(self.dpi_rows):
             return
-        dpi = max(200, min(8000, int(round(value / 50.0) * 50)))
+        dpi = self._clamp_dpi(value)
         row = self.dpi_rows[index]
         if row["slider"].value() != dpi:
             row["slider"].blockSignals(True)
@@ -1659,7 +1754,7 @@ class App(QMainWindow):
             row["entry"].setText(str(row["value"]))
             return
 
-        value = max(200, min(8000, int(round(value / 50.0) * 50)))
+        value = self._clamp_dpi(value)
         row["value"] = value
         row["slider"].blockSignals(True)
         row["slider"].setValue(value)
@@ -1671,8 +1766,13 @@ class App(QMainWindow):
         self._apply_now()
 
     def _add_level(self) -> None:
+        if self.max_levels is not None and len(self.dpi_rows) >= self.max_levels:
+            self._log(
+                f"Для этого устройства доступно не более {self.max_levels} уровней DPI."
+            )
+            return
         last = self.dpi_rows[-1]["value"] if self.dpi_rows else 800
-        dpi = max(200, min(8000, int(round((last + 800) / 50.0) * 50)))
+        dpi = self._clamp_dpi(min(self.dpi_max, last + 800))
         self._add_dpi_row(dpi)
         self._refresh_dpi_rows()
         self._update_remove_state()
@@ -1704,6 +1804,47 @@ class App(QMainWindow):
 
     def _update_remove_state(self) -> None:
         self.remove_btn.setEnabled(len(self.dpi_rows) > 1)
+        if hasattr(self, "add_btn"):
+            self.add_btn.setEnabled(
+                self.max_levels is None or len(self.dpi_rows) < self.max_levels
+            )
+
+    def _apply_device_limits(self, dpi: DpiInfo) -> None:
+        """Adapt the DPI editors to the sensor range reported by the device."""
+        minimum = max(DPI_FLOOR, int(getattr(dpi, "minimum", 0) or DPI_FLOOR))
+        maximum = max(minimum, int(getattr(dpi, "maximum", 0) or DPI_CEILING))
+        step = max(1, int(getattr(dpi, "step", 0) or DPI_STEP))
+
+        changed = (minimum, maximum, step) != (self.dpi_min, self.dpi_max, self.dpi_step)
+        self.dpi_min, self.dpi_max, self.dpi_step = minimum, maximum, step
+        self.max_levels = getattr(self.mouse, "max_levels", None)
+
+        for row in self.dpi_rows:
+            value = self._clamp_dpi(row["value"])
+            row["value"] = value
+            slider = row["slider"]
+            slider.blockSignals(True)
+            slider.setRange(minimum, maximum)
+            slider.setSingleStep(step)
+            slider.setPageStep(max(step, (maximum - minimum) // 10 or step))
+            slider.setValue(value)
+            slider.blockSignals(False)
+            row["entry"].setText(str(value))
+
+        while self.max_levels is not None and len(self.dpi_rows) > self.max_levels:
+            row = self.dpi_rows.pop()
+            self.dpi_box_layout.removeWidget(row["frame"])
+            self.radio_group.removeButton(row["radio"])
+            row["frame"].deleteLater()
+
+        self.active_index = max(0, min(len(self.dpi_rows) - 1, self.active_index))
+        self._refresh_dpi_rows()
+        self._update_remove_state()
+        self._sync_stage()
+        if changed:
+            self._log(
+                f"Диапазон DPI устройства: {minimum}–{maximum}, шаг {step}."
+            )
 
     def _active_dpi(self) -> int:
         if not self.dpi_rows:
@@ -1968,6 +2109,50 @@ class App(QMainWindow):
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
+        layout.addSpacing(10)
+        theme_label = QLabel("Тема оформления")
+        theme_label.setObjectName("fieldLabel")
+        layout.addWidget(theme_label)
+        layout.addSpacing(4)
+
+        self.theme_segment = SegmentedControl(
+            list(THEME_TO_LABEL.values()), self.tokens
+        )
+        self.theme_segment.set_value(THEME_TO_LABEL[self.theme_mode])
+        self.theme_segment.changed.connect(self._on_theme_segment)
+        layout.addWidget(self.theme_segment)
+
+        theme_hint = QLabel(
+            "«Системная» следует за оформлением Windows. "
+            "Светлую или тёмную можно выбрать вручную."
+        )
+        theme_hint.setObjectName("hint")
+        theme_hint.setWordWrap(True)
+        layout.addWidget(theme_hint)
+
+    def _on_theme_segment(self, label: str) -> None:
+        self._set_theme_mode(LABEL_TO_THEME.get(label, "system"))
+
+    def _set_theme_mode(self, mode: str) -> None:
+        if mode not in THEME_TO_LABEL:
+            mode = "system"
+        if mode == self.theme_mode:
+            self._sync_theme_controls()
+            return
+        self.theme_mode = mode
+        self._apply_theme()
+        self._persist()
+        self._log(f"Тема оформления: {THEME_TO_LABEL[mode].lower()}.")
+
+    def _sync_theme_controls(self) -> None:
+        label = THEME_TO_LABEL[self.theme_mode]
+        if hasattr(self, "theme_segment"):
+            self.theme_segment.set_value(label)
+        for mode, action in getattr(self, "theme_actions", {}).items():
+            action.blockSignals(True)
+            action.setChecked(mode == self.theme_mode)
+            action.blockSignals(False)
+
     def _on_autostart_toggled(self, checked: bool) -> None:
         if self._loading:
             return
@@ -2220,7 +2405,13 @@ class App(QMainWindow):
 
     # ------------------------------------------------------------------ theme
     def _apply_theme(self) -> None:
-        self.theme_name = "dark" if _system_is_dark() else "light"
+        if self.theme_mode == "dark":
+            dark = True
+        elif self.theme_mode == "light":
+            dark = False
+        else:
+            dark = _system_is_dark()
+        self.theme_name = "dark" if dark else "light"
         self.tokens = dict(THEMES[self.theme_name])
         check_name = "check_dark.svg" if self.theme_name == "dark" else "check_white.svg"
         self.tokens["CHECK_ICON"] = (ASSETS / check_name).as_posix()
@@ -2237,21 +2428,25 @@ class App(QMainWindow):
         self.status_dot.set_tokens(self.tokens)
         self.poll_segment.set_tokens(self.tokens)
         self.mode_segment.set_tokens(self.tokens)
+        if hasattr(self, "theme_segment"):
+            self.theme_segment.set_tokens(self.tokens)
         self.color_swatch.set_tokens(self.tokens)
         for swatch, _preset in self.preset_buttons:
             swatch.set_tokens(self.tokens)
         self.stage.set_tokens(self.tokens)
 
         self._refresh_dpi_rows()
+        self._sync_theme_controls()
         if self.isVisible():
             self._apply_dark_title_bar()
         self.update()
 
     def _on_color_scheme_changed(self, _scheme=None) -> None:
-        self._apply_theme()
+        if self.theme_mode == "system":
+            self._apply_theme()
 
     def _on_palette_changed(self, _palette=None) -> None:
-        if self._palette_guard:
+        if self._palette_guard or self.theme_mode != "system":
             return
         desired = "dark" if _system_is_dark() else "light"
         if desired != self.theme_name:
@@ -2307,40 +2502,61 @@ class App(QMainWindow):
         )
 
     def _connect_impl(self):
-        self.mouse.close()
-        self.mouse.open()
-        dpi = self.mouse.get_dpi_info()
+        if self.mouse is not None:
+            self.mouse.close()
+            self.mouse = None
+        preferred = self.cfg.get("app", {}).get("last_device") or None
+        mouse = open_preferred(preferred)
+        dpi = mouse.get_dpi_info()
         try:
-            lighting = self.mouse.get_lighting_info()
+            lighting = mouse.get_lighting_info()
         except HidppError:
             lighting = None
         try:
-            rate = self.mouse.get_polling_rate()
+            rate = mouse.get_polling_rate()
         except HidppError:
             rate = 0
         try:
-            onboard = self.mouse.get_onboard_mode()
+            onboard = mouse.get_onboard_mode()
         except HidppError:
             onboard = 0
-        return dpi, lighting, rate, onboard
+        return mouse, dpi, lighting, rate, onboard
 
     def _after_connect(self, payload) -> None:
-        dpi, lighting, rate, onboard = payload
-        product = self.mouse.product or "Logitech mouse"
+        mouse, dpi, lighting, rate, onboard = payload
+        self.mouse = mouse
+        self.backend_key = mouse.backend_key
+        product = mouse.product or BACKEND_LABELS.get(
+            self.backend_key, "Игровая мышь"
+        )
         self._last_product = product
+        pid = mouse.pid or 0
+        connection = getattr(mouse, "connection_name", "")
 
         self._set_status(f"Подключено · {product}", "ok")
         self.connect_btn.setEnabled(True)
         self.connect_btn.setText("Переподключить")
         self.device_name_label.setText(product)
-        self.device_meta_label.setText(
-            f"PID 0x{self.mouse.pid:04X}\n"
-            f"Сенсор {dpi.minimum}–{dpi.maximum} DPI · шаг {dpi.step}\n"
-            f"На мыши: {dpi.current} DPI · {rate} Гц"
+        meta = [f"PID 0x{pid:04X}" + (f" · {connection}" if connection else "")]
+        meta.append(f"Сенсор {dpi.minimum}–{dpi.maximum} DPI · шаг {dpi.step}")
+        meta.append(f"На мыши: {dpi.current} DPI · {rate} Гц")
+        self.device_meta_label.setText("\n".join(meta))
+        self._log(
+            f"Подключено: {product} (PID 0x{pid:04X}) · "
+            f"{mouse.backend_name}"
         )
-        self._log(f"Подключено: {product} (PID 0x{self.mouse.pid:04X})")
         self._log(f"DPI {dpi.minimum}–{dpi.maximum}, шаг {dpi.step}, текущий {dpi.current}")
-        if lighting:
+        if self.backend_key == "attack_shark":
+            self._log(
+                "Подсветка Attack Shark: статичный / дыхание / неон, "
+                "яркость 1–8, скорость 1–5."
+            )
+            if dpi.levels:
+                self._log(
+                    "Уровни DPI в профиле мыши: "
+                    + ", ".join(str(value) for value in dpi.levels)
+                )
+        elif lighting:
             effects = ", ".join(
                 f"0x{effect_id:02X}→{index}"
                 for effect_id, index in sorted(lighting.effects.items())
@@ -2358,6 +2574,8 @@ class App(QMainWindow):
                 "переключится в host-режим (иначе polling rate не меняется)."
             )
 
+        self._apply_device_limits(dpi)
+        self.cfg.setdefault("app", {})["last_device"] = self.backend_key
         self._apply_pending = False
         self._dirty = set(ALL_FIELDS)
         self._apply_now()
@@ -2372,7 +2590,7 @@ class App(QMainWindow):
             return
         self._set_status("Поиск устройства…", "busy")
         self._run(
-            G102Mouse.enumerate,
+            enumerate_devices,
             on_success=self._on_enumerated,
             on_error=self._on_probe_error,
             quiet=True,
@@ -2380,9 +2598,14 @@ class App(QMainWindow):
 
     def _on_enumerated(self, devices) -> None:
         if not devices:
-            self._log("Мышь не найдена. Подключите её и нажмите «Подключить мышь».")
+            self._log(
+                "Поддерживаемые мыши не найдены. Подключите устройство "
+                "и нажмите «Подключить мышь»."
+            )
             self._set_status("Не подключено", "idle")
             return
+        names = sorted({str(item.get("product")) for item in devices})
+        self._log("Найдено: " + ", ".join(names))
         self.connect()
 
     def _on_probe_error(self, exc) -> None:
@@ -2390,7 +2613,7 @@ class App(QMainWindow):
         self._set_status("Не подключено", "error")
 
     def _manual_apply(self) -> None:
-        if not self.mouse.connected:
+        if self.mouse is None or not self.mouse.connected:
             self._log("Сначала подключите устройство.")
             return
         self._persist()
@@ -2417,7 +2640,7 @@ class App(QMainWindow):
         self._apply_timer.stop()
         self._persist()
 
-        if not self.mouse.connected:
+        if self.mouse is None or not self.mouse.connected:
             self._dirty.clear()
             return
         if self._applying:
@@ -2456,7 +2679,7 @@ class App(QMainWindow):
         self._apply_pending = False
         self._dirty.clear()
         self._set_status("Ошибка применения", "error")
-        if self.mouse.connected:
+        if self.mouse is not None and self.mouse.connected:
             self._log(f"Ошибка применения: {exc}")
         else:
             self._log(f"Устройство отключилось: {exc}")
@@ -2464,8 +2687,12 @@ class App(QMainWindow):
     def _restore_status(self) -> None:
         if self._applying or self._closing:
             return
-        if self.mouse.connected:
-            product = self._last_product or self.mouse.product or "Logitech mouse"
+        if self.mouse is not None and self.mouse.connected:
+            product = (
+                self._last_product
+                or self.mouse.product
+                or BACKEND_LABELS.get(self.backend_key, "Игровая мышь")
+            )
             self._set_status(f"Подключено · {product}", "ok")
         else:
             self._set_status("Не подключено", "idle")
@@ -2473,6 +2700,10 @@ class App(QMainWindow):
     def _current_settings(self) -> dict:
         """Snapshot widget values on the UI thread before any HID work starts."""
         return {
+            "levels": [int(row["value"]) for row in self.dpi_rows],
+            "dpi_index": max(
+                0, min(len(self.dpi_rows) - 1, self.active_index)
+            ),
             "dpi": self._active_dpi(),
             "rate": int(self.poll_rate),
             "mode": str(self.mode),
@@ -2482,8 +2713,10 @@ class App(QMainWindow):
         }
 
     def _apply_all_impl(self, settings: dict, fields: set[str]):
+        if self.mouse is None:
+            raise HidppError("Устройство не подключено.")
         if "dpi" in fields:
-            self.mouse.set_dpi(settings["dpi"])
+            self.mouse.apply_dpi(settings["levels"], settings["dpi_index"])
         if "rate" in fields:
             self.mouse.set_polling_rate(settings["rate"])
         if "light" in fields:
@@ -2546,6 +2779,8 @@ class App(QMainWindow):
                     if hasattr(self, "autostart_check")
                     else False
                 ),
+                "theme": self.theme_mode,
+                "last_device": self.backend_key or self.cfg.get("app", {}).get("last_device", ""),
             },
         }
         save_config(self.cfg)
@@ -2561,10 +2796,12 @@ class App(QMainWindow):
         box.setWindowTitle("О программе")
         box.setTextFormat(Qt.TextFormat.PlainText)
         box.setText(
-            f"G102 Lightsync Control {APP_VERSION}\n\n"
-            "Неофициальная панель управления мышью Logitech G102 / G203 "
-            "через HID++ 2.0.\n"
-            "Проект не связан с Logitech и не одобрен ею.\n\n"
+            f"Lightsync Control {APP_VERSION}\n\n"
+            "Неофициальная панель управления мышами Logitech G102 / G203 "
+            "Lightsync (HID++ 2.0) и Attack Shark X11 (вендорный HID-протокол).\n"
+            "Проект не связан с Logitech, Attack Shark и не одобрен ими.\n\n"
+            "Протокол Attack Shark X11 основан на проекте\n"
+            "github.com/HarukaYamamoto0/attack-shark-x11-driver.\n"
             "Иконка мыши: Lucide «mouse» (ISC)."
         )
         box.setIconPixmap(self.windowIcon().pixmap(64, 64))
@@ -2620,10 +2857,11 @@ class App(QMainWindow):
             self.tray.hide()
 
         self.pool.waitForDone(2500)
-        try:
-            self.mouse.close()
-        except Exception:  # noqa: BLE001 - closing anyway
-            pass
+        if self.mouse is not None:
+            try:
+                self.mouse.close()
+            except Exception:  # noqa: BLE001 - closing anyway
+                pass
         super().closeEvent(event)
 
 

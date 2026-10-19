@@ -107,6 +107,11 @@ class LightingInfo:
 class G102Mouse:
     """Small, thread-safe HID++ 2.0 client."""
 
+    backend_key = "logitech"
+    backend_name = "Logitech HID++ 2.0"
+    vendor_id = VENDOR_ID
+    max_levels = None  # the app stores presets, so there is no hard limit
+
     def __init__(self) -> None:
         self._dev = None
         self._lock = threading.RLock()
@@ -405,6 +410,13 @@ class G102Mouse:
             bytes((sensor, (dpi >> 8) & 0xFF, dpi & 0xFF, 0x00)),
         )
         return dpi
+
+    def apply_dpi(self, levels: List[int], active_index: int) -> None:
+        """Apply the preset list, using the selected level as current DPI."""
+        if not levels:
+            return
+        index = max(0, min(len(levels) - 1, int(active_index)))
+        self.set_dpi(int(levels[index]))
 
     # ------------------------------------------------------------ polling rate
     def get_supported_polling_rates(self) -> List[int]:
